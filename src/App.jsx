@@ -314,13 +314,6 @@ export default function App() {
       return;
     }
 
-    // FIX 2: Guard against starting a second recognition instance
-    // while one is already running.
-    if (activeRef.current) {
-      console.log("Already listening — skipping duplicate start");
-      return;
-    }
-
     // Stop any old recognition cleanly
     if (recRef.current) {
       try { recRef.current.stop(); } catch (_) {}
@@ -394,12 +387,13 @@ export default function App() {
 
     rec.onerror = (e) => {
       console.log("Speech error:", e.error);
+      // Always reset activeRef so the next startListening call isn't blocked
       activeRef.current = false;
 
       if (e.error === "no-speech") {
-        // FIX 5: Only auto-retry in hands-free mode; don't loop forever otherwise
+        // Silently retry in hands-free mode; stop otherwise
         if (handsFreeRef.current) {
-          setTimeout(() => startListeningRef.current?.(), 2000);
+          setTimeout(() => startListeningRef.current?.(), 800);
         } else {
           setStatus("Idle");
         }
@@ -409,18 +403,26 @@ export default function App() {
       if (e.error === "not-allowed" || e.error === "permission-denied") {
         setMicOk(false);
         setToast("Microphone blocked. Allow mic in Chrome settings and refresh.");
+        handsFreeRef.current = false;
+        setHandsFree(false);
         setStatus("Idle");
         return;
       }
 
-      setStatus("Idle");
+      // For any other error, reset cleanly
+      if (handsFreeRef.current) {
+        setTimeout(() => startListeningRef.current?.(), 1000);
+      } else {
+        setStatus("Idle");
+      }
     };
 
     rec.onend = () => {
       console.log("Recognition ended");
-      // FIX 6: If recognition ends unexpectedly while we're still in
-      // hands-free Listening state, restart it.
-      if (handsFreeRef.current && statusRef.current === "Listening") {
+      // Do NOT restart here — onerror handles no-speech retries.
+      // Only restart if recognition ended mid-session WITHOUT an error
+      // (e.g. browser cut it off) and we are still actively listening.
+      if (handsFreeRef.current && activeRef.current === false && statusRef.current === "Listening") {
         setTimeout(() => startListeningRef.current?.(), 500);
       }
     };
