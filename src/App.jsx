@@ -317,7 +317,6 @@ export default function App() {
       try { recRef.current.abort(); } catch (_) {}
       recRef.current = null;
     }
-    // Clear any previous idle timer
     if (sessionTimerRef.current) {
       clearTimeout(sessionTimerRef.current);
       sessionTimerRef.current = null;
@@ -327,37 +326,20 @@ export default function App() {
     recRef.current       = rec;
     gotResultRef.current = false;
 
-    // continuous: true  → Chrome keeps the mic open indefinitely.
-    // no-speech error fires for background noise but session DOES NOT end.
-    // User can speak any time. Session only ends when we call rec.stop().
-    rec.lang           = "en-US";   // en-US model is more robust than en-IN
-    rec.continuous     = true;
-    rec.interimResults = false;
+    rec.lang            = "en-US";
+    rec.continuous      = true;
+    rec.interimResults  = false;
     rec.maxAlternatives = 1;
 
     activeRef.current = true;
     setStatus("Listening");
 
-    // Auto-stop after 60s of silence so we don't hold the mic forever
-    sessionTimerRef.current = setTimeout(() => {
-      if (activeRef.current && handsFreeRef.current && !gotResultRef.current) {
-        console.log("60s silence — auto stopping");
-        try { rec.stop(); } catch (_) {}
-        activeRef.current    = false;
-        handsFreeRef.current = false;
-        setHandsFree(false);
-        setStatus("Idle");
-        setToast("No speech for 60 s. Click the mic to try again.");
-      }
-    }, 60000);
-
-    rec.onstart     = () => console.log("Mic open — speak any time");
+    rec.onstart      = () => console.log("🎙 Mic open — speak now");
     rec.onaudiostart = () => console.log("Audio detected");
     rec.onspeechstart = () => console.log("✅ Speech detected!");
     rec.onspeechend   = () => console.log("Speech ended");
 
     rec.onresult = async (event) => {
-      // With continuous:true, grab the latest final result
       const lastResult = event.results[event.results.length - 1];
       if (!lastResult.isFinal) return;
 
@@ -365,11 +347,10 @@ export default function App() {
       console.log("You said:", transcript);
       if (!transcript) return;
 
-      // Got speech — cancel idle timer and stop listening
       clearTimeout(sessionTimerRef.current);
-      gotResultRef.current  = true;
+      gotResultRef.current     = true;
       noSpeechCountRef.current = 0;
-      activeRef.current = false;
+      activeRef.current        = false;
       setStatus("Thinking");
       try { rec.stop(); } catch (_) {}
 
@@ -380,8 +361,12 @@ export default function App() {
           body: JSON.stringify({ command: transcript }),
         });
         const data  = await res.json();
-        const reply = data.response || "No response";
+        // data is { response: "..." } — extract the string
+        const reply = typeof data.response === "string"
+          ? data.response
+          : JSON.stringify(data.response) || "No response";
 
+        console.log("Nova says:", reply);
         setResponse(reply);
         setShowResp(true);
         setStatus("Speaking");
@@ -395,37 +380,51 @@ export default function App() {
           }
         });
       } catch (err) {
-        console.error(err);
+        console.error("Fetch error:", err);
         setStatus("Idle");
       }
     };
 
     rec.onerror = (e) => {
-      // With continuous:true, no-speech does NOT end the session — just ignore it.
-      // The mic stays open. User can speak whenever ready.
+      // Chrome ALWAYS kills the session on no-speech even with continuous:true.
+      // We handle everything in onend — just log here.
       if (e.error === "no-speech") {
-        console.log("Background noise (mic still open — speak now)");
+        console.log("No speech in this window");
         return;
       }
       if (e.error === "aborted") return;
 
-      // Fatal error
       console.warn("Recognition error:", e.error);
       clearTimeout(sessionTimerRef.current);
       activeRef.current = false;
       setStatus("Idle");
     };
 
-    // onend only fires here if Chrome crashes/kills the session unexpectedly.
-    // Normal flow: we call rec.stop() → onend → we restart manually.
     rec.onend = () => {
-      console.log("Recognition ended");
       clearTimeout(sessionTimerRef.current);
-      // Restart if we're still in hands-free mode and didn't get a result yet
-      if (!gotResultRef.current && activeRef.current && handsFreeRef.current) {
-        console.log("Unexpected end — restarting");
-        setTimeout(() => startListeningRef.current?.(), 800);
+      console.log("Session ended");
+
+      // Normal end after getting speech — don't do anything here
+      if (gotResultRef.current) return;
+
+      // Session ended without speech
+      if (!activeRef.current || !handsFreeRef.current) return;
+
+      noSpeechCountRef.current += 1;
+      console.log(`Silent session ${noSpeechCountRef.current}/4`);
+
+      if (noSpeechCountRef.current >= 4) {
+        noSpeechCountRef.current = 0;
+        activeRef.current        = false;
+        handsFreeRef.current     = false;
+        setHandsFree(false);
+        setStatus("Idle");
+        setToast("Can't hear you. Try a quieter spot or check mic permissions.");
+        return;
       }
+
+      // Wait 2s before next attempt — gives mic hardware time to reset
+      setTimeout(() => startListeningRef.current?.(), 2000);
     };
 
     try {
