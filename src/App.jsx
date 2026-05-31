@@ -391,18 +391,19 @@ export default function App() {
 
       if (e.error === "no-speech") {
         noSpeechCountRef.current += 1;
-        console.log(`No speech (${noSpeechCountRef.current}/5) — retrying`);
 
-        // Stop retrying after 5 silent attempts — user probably walked away
         if (noSpeechCountRef.current >= 5) {
+          console.log("No speech (5/5) — stopping");
           noSpeechCountRef.current = 0;
+          activeRef.current    = false;
           handsFreeRef.current = false;
           setHandsFree(false);
           setStatus("Idle");
           setToast("No speech detected. Click the mic to try again.");
           return;
         }
-        // Don't restart here — onend will fire and handle it
+
+        console.log(`No speech (${noSpeechCountRef.current}/5) — retrying`);
         return;
       }
 
@@ -417,7 +418,7 @@ export default function App() {
     rec.onend = () => {
       console.log("Recognition ended");
       if (!gotResultRef.current && activeRef.current && handsFreeRef.current) {
-        setTimeout(() => startListeningRef.current?.(), 600);
+        setTimeout(() => startListeningRef.current?.(), 1000); // 1s gap so mic resets cleanly
       }
     };
 
