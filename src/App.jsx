@@ -230,10 +230,12 @@ export default function App() {
   const [toast,     setToast]     = useState("");   // FIX: user-visible error messages
   const [micOk,     setMicOk]     = useState(true); // FIX: track mic permission state
 
-  const recRef            = useRef(null);
-  const activeRef         = useRef(false);
-  const handsFreeRef      = useRef(false);
-  const startListeningRef = useRef(null);
+  const recRef             = useRef(null);
+  const activeRef          = useRef(false);
+  const handsFreeRef       = useRef(false);
+  const startListeningRef  = useRef(null);
+  const noSpeechCountRef   = useRef(0);
+  const gotResultRef       = useRef(false);
 
   // FIX: Use a ref for status inside polling so the interval never depends on
   // the status state value and does NOT restart on every status change.
@@ -306,134 +308,126 @@ export default function App() {
 
   // ── CORE: one full listen → think → speak cycle ──
   const startListening = useCallback(() => {
-  const SR =
-    window.SpeechRecognition ||
-    window.webkitSpeechRecognition;
+    const SR =
+      window.SpeechRecognition ||
+      window.webkitSpeechRecognition;
 
-  if (!SR) {
-    alert("Use Chrome browser");
-    return;
-  }
+    if (!SR) {
+      alert("Use Chrome browser");
+      return;
+    }
 
-  // stop old recognition
-  if (recRef.current) {
-    try {
-      recRef.current.stop();
-    } catch (_) {}
-  }
+    // Stop old recognition cleanly
+    if (recRef.current) {
+      try { recRef.current.abort(); } catch (_) {}
+      recRef.current = null;
+    }
 
-  const rec = new SR();
-  recRef.current = rec;
+    const rec = new SR();
+    recRef.current  = rec;
+    gotResultRef.current = false;
 
-rec.lang = "en-IN";
-rec.continuous = true;
-rec.interimResults = false;
-rec.maxAlternatives = 1; 
-rec.pauseThreshold = 2;
-rec.phraseTimeLimit = 8;  // ✅ FIX: more alternatives = better accuracy
+    rec.lang           = "en-IN";
+    rec.continuous     = false;   // single-shot: fires onresult once, then onend
+    rec.interimResults = false;
+    rec.maxAlternatives = 1;
 
-  activeRef.current = true;
-  setStatus("Listening");
+    activeRef.current = true;
+    setStatus("Listening");
 
-  console.log("Recognition started");
+    rec.onstart = () => console.log("Mic listening...");
+    rec.onaudiostart  = () => console.log("Audio detected");
+    rec.onspeechstart = () => console.log("Speech started");
+    rec.onspeechend   = () => console.log("Speech ended");
 
-  rec.onstart = () => {
-    console.log("Mic listening...");
-  };
+    rec.onresult = async (event) => {
+      const transcript = Array.from(event.results)
+        .map((r) => r[0].transcript)
+        .join("")
+        .trim();
 
-  // ✅ FIX: removed duplicate onsoundstart / onspeechstart handlers
-  rec.onaudiostart  = () => console.log("Audio detected");
-  rec.onsoundstart  = () => console.log("Sound detected");
-  rec.onspeechstart = () => console.log("Speech started");
-  rec.onspeechend   = () => console.log("Speech ended");
+      console.log("User said:", transcript);
+      if (!transcript) return;
 
-  rec.onresult = async (event) => {
-    const transcript = Array.from(
-      event.results
-    )
-      .map((r) => r[0].transcript)
-      .join("")
-      .trim();
+      gotResultRef.current  = true;
+      noSpeechCountRef.current = 0;   // reset retry counter on success
+      activeRef.current = false;
+      setStatus("Thinking");
 
-    console.log("User said:", transcript);
+      try { rec.stop(); } catch (_) {}
 
-    if (!transcript) return;
+      try {
+        const res = await fetch(
+          `${import.meta.env.VITE_API_URL}/command`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ command: transcript }),
+          }
+        );
+        const data  = await res.json();
+        const reply = data.response || "No response";
 
-    try {
-      rec.stop();
-    } catch (_) {}
+        setResponse(reply);
+        setShowResp(true);
+        setStatus("Speaking");
 
-    activeRef.current = false;
-    setStatus("Thinking");
+        speak(reply, () => {
+          setShowResp(false);
+          if (handsFreeRef.current) {
+            setTimeout(() => startListeningRef.current?.(), 1000);
+          } else {
+            setStatus("Idle");
+          }
+        });
+      } catch (err) {
+        console.error(err);
+        setStatus("Idle");
+      }
+    };
 
-    try {
-      const res = await fetch(
-        `${import.meta.env.VITE_API_URL}/command`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type":
-              "application/json",
-          },
-          body: JSON.stringify({
-            command: transcript,
-          }),
-        }
-      );
+    rec.onerror = (e) => {
+      console.log("Speech error:", e.error);
 
-      const data = await res.json();
+      if (e.error === "no-speech") {
+        noSpeechCountRef.current += 1;
+        console.log(`No speech (${noSpeechCountRef.current}/5) — retrying`);
 
-      const reply =
-        data.response || "No response";
-
-      setResponse(reply);
-      setShowResp(true);
-      setStatus("Speaking");
-
-      speak(reply, () => {
-        setShowResp(false);
-
-        if (handsFreeRef.current) {
-          setTimeout(() => {
-            startListeningRef.current?.();
-          }, 1000);
-        } else {
+        // Stop retrying after 5 silent attempts — user probably walked away
+        if (noSpeechCountRef.current >= 5) {
+          noSpeechCountRef.current = 0;
+          handsFreeRef.current = false;
+          setHandsFree(false);
           setStatus("Idle");
+          setToast("No speech detected. Click the mic to try again.");
+          return;
         }
-      });
+        // Don't restart here — onend will fire and handle it
+        return;
+      }
+
+      if (e.error === "aborted") return; // we triggered this ourselves
+
+      console.warn("Recognition error:", e.error);
+      setStatus("Idle");
+    };
+
+    // onend always fires after onerror and after onresult+stop.
+    // If we haven't got a result yet and we're still active → restart.
+    rec.onend = () => {
+      console.log("Recognition ended");
+      if (!gotResultRef.current && activeRef.current && handsFreeRef.current) {
+        setTimeout(() => startListeningRef.current?.(), 600);
+      }
+    };
+
+    try {
+      rec.start();
     } catch (err) {
       console.error(err);
       setStatus("Idle");
     }
-  };
-
- rec.onerror = (e) => {
-  console.log("Speech error:", e.error);
-
-  if (e.error === "no-speech") {
-    console.log("No speech detected — retrying");
-
-    setTimeout(() => {
-      startListeningRef.current?.();
-    }, 2000);
-
-    return;
-  }
-
-  setStatus("Idle");
-};
-
-  rec.onend = () => {
-    console.log("Recognition ended");
-  };
-
-  try {
-    rec.start();
-  } catch (err) {
-    console.error(err);
-    setStatus("Idle");
-  }
-}, [speak]);
+  }, [speak]);
 
   // Keep ref in sync
   useEffect(() => {
